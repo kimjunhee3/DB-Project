@@ -1,0 +1,569 @@
+import streamlit as st
+import sqlite3
+import datetime
+import pandas as pd
+import plotly.graph_objects as go
+from PIL import Image, ImageDraw, ImageFont 
+import io 
+from pathlib import Path 
+
+# --- 페이지 설정 (반드시 첫 번째 st 명령어야 함) ---
+st.set_page_config(page_title="중고 아이폰 분석", layout="wide")
+
+# --- 스크립트의 현재 위치를 기준으로 'CSV' 파일 경로를 절대 경로로 지정 ---
+BASE_DIR = Path(__file__).parent 
+MAP_FILE_PATH = BASE_DIR / "dong_gu_map.csv" # 👈 'dong_gu_map.csv'를 찾도록 수정
+
+# --- 1. 데이터베이스 파일 경로 (사용자 절대 경로) ---
+DB_FILE = r"C:\Users\jjunh\OneDrive\바탕 화면\대학\4학년 2학기\데이터베이스\데.베 구축\project2.db"
+
+# --- [지도] 서울 25개 구 픽셀 좌표 맵 (x, y) ---
+SEOUL_GU_COORDINATES = {
+    '강남구': (335, 260), '강동구': (410, 240), '강북구': (275, 90),
+    '강서구': (40, 200), '관악구': (210, 310), '광진구': (350, 215),
+    '구로구': (80, 280), '금천구': (130, 320), '노원구': (370, 70),
+    '도봉구': (320, 55), '동대문구': (310, 155), '동작구': (220, 265),
+    '마포구': (140, 190), '서대문구': (170, 160), '서초구': (280, 280),
+    '성동구': (300, 210), '성북구': (270, 125), '송파구': (380, 260),
+    '양천구': (75, 240), '영등포구': (150, 250), '용산구': (250, 230),
+    '은평구': (140, 100), '종로구': (240, 160), '중구': (250, 190),
+    '중랑구': (360, 130)
+}
+
+# --- DB 연결 ---
+def get_db_connection():
+    """데이터베이스에 연결하고 connection 객체를 반환합니다."""
+    try:
+        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True) 
+        return conn
+    except Exception as e:
+        st.error(f"DB 연결 오류: {e}")
+        st.error(f"지정된 DB 파일 경로: {DB_FILE}")
+        return None
+
+# --- CSV 파일을 읽도록 pd.read_csv로 수정 ---
+@st.cache_data
+def load_manual_map_sql_chunk(file_path): 
+    """
+    'dong_gu_map.csv' CSV 파일을 읽어 SQL의 'UNION SELECT ...' 구문 덩어리를 반환합니다.
+    """
+    try:
+        df = pd.read_csv(file_path, encoding='utf-8') 
+        
+        if 'dong' not in df.columns or 'sigungu' not in df.columns:
+            st.error(f"'{file_path}'에 'dong' 또는 'sigungu' 컬럼이 없습니다.")
+            return ""
+            
+        union_statements = []
+        for index, row in df.iterrows():
+            dong_clean = str(row['dong']).replace("'", "''")
+            sigungu_clean = str(row['sigungu']).replace("'", "''")
+            
+            if dong_clean and sigungu_clean: 
+                union_statements.append(f"SELECT '{dong_clean}', '{sigungu_clean}'")
+        
+        if union_statements:
+            return " UNION ".join(union_statements)
+        else:
+            return ""
+            
+    except FileNotFoundError:
+        st.warning(f"수동 매핑 파일('{file_path}')을 찾을 수 없습니다. DB 데이터만 사용합니다.")
+        return ""
+    except Exception as e:
+        st.error(f"CSV 매핑 파일 로드 오류 ({file_path}): {e}") 
+        return ""
+
+# --- 헬퍼 함수: 동적 SQL 쿼리 생성 ---
+def build_dynamic_query_parts(platform, model, start_date, end_date):
+    """
+    필터 조건에 따라 SQL WHERE절과 파라미터를 생성합니다.
+    """
+    params = []
+    where_clause = " WHERE p.posted_date BETWEEN ? AND ? "
+    params.extend([str(start_date), str(end_date)])
+
+    if platform != '전체':
+        where_clause += " AND pf.name = ? "
+        params.append(platform)
+
+    if model == 'iPhone 16 Pro':
+        where_clause += " AND (pr.model LIKE ? OR pr.model LIKE ?) "
+        params.extend(['%iPhone 16 Pro%', '%아이폰 16 프로%'])
+    elif model == 'iPhone 16':
+        where_clause += " AND (pr.model LIKE ? OR pr.model LIKE ?) "
+        params.extend(['%iPhone 16%', '%아이폰 16%'])
+        where_clause += " AND pr.model NOT LIKE '%Pro%' AND pr.model NOT LIKE '%프로%' "
+    elif model == 'iPhone 15 Pro':
+        where_clause += " AND (pr.model LIKE ? OR pr.model LIKE ?) "
+        params.extend(['%iPhone 15 Pro%', '%아이폰 15 프로%'])
+    elif model == 'iPhone 15': 
+        where_clause += " AND (pr.model LIKE ? OR pr.model LIKE ?) "
+        params.extend(['%iPhone 15%', '%아이폰 15%'])
+        where_clause += " AND pr.model NOT LIKE '%Pro%' AND pr.model NOT LIKE '%프로%' "
+    elif model == 'iPhone 14 Pro':
+        where_clause += " AND (pr.model LIKE ? OR pr.model LIKE ?) "
+        params.extend(['%iPhone 14 Pro%', '%아이폰 14 프로%'])
+    elif model == 'iPhone 14': 
+        where_clause += " AND (pr.model LIKE ? OR pr.model LIKE ?) "
+        params.extend(['%iPhone 14%', '%아이폰 14%'])
+        where_clause += " AND pr.model NOT LIKE '%Pro%' AND pr.model NOT LIKE '%프로%' "
+        
+    return where_clause, params
+
+# --- 백엔드 함수 1: KPI 및 ID ---
+@st.cache_data
+def fetch_kpi_and_ids(platform, model, start_date, end_date):
+    """'총 매물 수', '평균 가격', '게시글 ID 리스트'를 DB에서 조회"""
+    
+    where_clause, params = build_dynamic_query_parts(platform, model, start_date, end_date)
+    sql = f"""
+    SELECT
+        COUNT(p.post_id), AVG(p.price_krw), GROUP_CONCAT(p.post_id, ', ')
+    FROM posts AS p
+    JOIN platforms AS pf ON p.platform_id = pf.platform_id
+    JOIN products AS pr ON p.product_id = pr.product_id
+    {where_clause}
+    """
+    
+    conn = get_db_connection()
+    if conn is None: return 0, 0, []
+
+    total_count, avg_price, id_list_str = 0, 0, ""
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        result = cursor.fetchone()
+        if result:
+            total_count = result[0] if result[0] is not None else 0
+            avg_price = result[1] if result[1] is not None else 0
+            id_list_str = result[2] if result[2] is not None else ""
+    except Exception as e:
+        st.error(f"KPI 쿼리 오류: {e}")
+    finally:
+        if conn:
+            conn.close() 
+
+    id_list = id_list_str.split(', ') if id_list_str else []
+    return total_count, avg_price, id_list
+
+# --- 💡💡💡 [신규 추가] 매핑에 실패한 '동' 목록을 가져오는 디버그 함수 💡💡💡 ---
+@st.cache_data
+def fetch_unmapped_dongs(platform, model, start_date, end_date, map_file_path):
+    """매핑이 필요한(sigungu=NULL) 데이터 중, CSV 맵에서 매핑에 실패한 '동' 목록 조회"""
+    
+    where_clause, params = build_dynamic_query_parts(platform, model, start_date, end_date)
+    
+    # 동일한 로직으로 CSV 맵 로드
+    manual_map_sql_chunk = load_manual_map_sql_chunk(map_file_path)
+
+    sql = f"""
+    WITH DongGuMapSource AS (
+        SELECT dong, sigungu 
+        FROM regions
+        WHERE sigungu IS NOT NULL AND sigungu != '' AND dong IS NOT NULL AND dong != ''
+        {"UNION " + manual_map_sql_chunk if manual_map_sql_chunk else ""} 
+    ),
+    DongGuMap AS (
+        SELECT 
+            REPLACE(TRIM(dong), ' ', '') AS clean_dong, 
+            MAX(sigungu) AS mapped_sigungu
+        FROM DongGuMapSource
+        WHERE dong IS NOT NULL AND sigungu IS NOT NULL
+        GROUP BY clean_dong
+    )
+    -- [수정] 매핑에 '실패'한 목록을 찾는 쿼리
+    SELECT 
+        r.dong AS "DB에 저장된 '동' 이름", 
+        COUNT(p.post_id) as "매물 수"
+    FROM posts AS p
+    JOIN platforms AS pf ON p.platform_id = pf.platform_id
+    JOIN products AS pr ON p.product_id = pr.product_id
+    JOIN regions AS r ON p.region_id = r.region_id
+    LEFT JOIN DongGuMap AS dgm 
+        ON REPLACE(TRIM(r.dong), ' ', '') = dgm.clean_dong
+    {where_clause} 
+    AND r.sigungu IS NULL -- 1. '구'가 NULL이라 매핑이 필요한데
+    AND dgm.mapped_sigungu IS NULL -- 2. 맵(DongGuMap)에서 일치하는 '동'을 못 찾았고
+    AND r.dong IS NOT NULL AND r.dong != '' -- 3. '동' 이름 자체는 존재하는 경우
+    GROUP BY r.dong
+    ORDER BY "매물 수" DESC
+    """
+    
+    conn = get_db_connection()
+    if conn is None: return pd.DataFrame(columns=["DB에 저장된 '동' 이름", "매물 수"])
+    
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+        return df
+    except Exception as e:
+        st.error(f"매핑 실패 쿼리 오류: {e}")
+        return pd.DataFrame(columns=["DB에 저장된 '동' 이름", "매물 수"])
+    finally:
+        if conn:
+            conn.close() 
+
+# --- 'dong' 이름의 공백을 제거(TRIM, REPLACE)하는 SQL로 수정된 함수 ---
+@st.cache_data
+def fetch_regional_data(platform, model, start_date, end_date, map_file_path): # 👈 인자 추가
+    """지역별(sigungu) 매물 분포 Top 10 조회 (CSV 파일 기반 + DB 데이터로 보완)"""
+    
+    where_clause, params = build_dynamic_query_parts(platform, model, start_date, end_date)
+    
+    manual_map_sql_chunk = load_manual_map_sql_chunk(map_file_path) 
+
+    sql = f"""
+    WITH DongGuMapSource AS (
+        SELECT dong, sigungu 
+        FROM regions
+        WHERE sigungu IS NOT NULL AND sigungu != ''
+          AND dong IS NOT NULL AND dong != ''
+        {"UNION " + manual_map_sql_chunk if manual_map_sql_chunk else ""} 
+    ),
+    DongGuMap AS (
+        SELECT 
+            REPLACE(TRIM(dong), ' ', '') AS clean_dong, 
+            MAX(sigungu) AS mapped_sigungu
+        FROM DongGuMapSource
+        WHERE dong IS NOT NULL AND sigungu IS NOT NULL
+        GROUP BY clean_dong
+    )
+    SELECT 
+        COALESCE(r.sigungu, dgm.mapped_sigungu) AS final_gu,
+        COUNT(p.post_id) as count
+    FROM posts AS p
+    JOIN platforms AS pf ON p.platform_id = pf.platform_id
+    JOIN products AS pr ON p.product_id = pr.product_id
+    JOIN regions AS r ON p.region_id = r.region_id
+    LEFT JOIN DongGuMap AS dgm 
+    ON REPLACE(TRIM(r.dong), ' ', '') = dgm.clean_dong
+    {where_clause}
+    AND COALESCE(r.sigungu, dgm.mapped_sigungu) IS NOT NULL 
+    AND COALESCE(r.sigungu, dgm.mapped_sigungu) != ''
+    GROUP BY final_gu
+    ORDER BY count DESC
+    LIMIT 10
+    """
+    
+    conn = get_db_connection()
+    if conn is None: return pd.DataFrame(columns=['sigungu', 'count'])
+    
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+        df = df.rename(columns={"final_gu": "sigungu"})
+        return df
+    except Exception as e:
+        if "no such column: dong" in str(e):
+            st.error("오류: 'regions' 테이블에 'dong' 컬럼이 없습니다. '동' 데이터를 보정할 수 없습니다.")
+        else:
+            st.error(f"지역별 쿼리 오류: {e}")
+        return pd.DataFrame(columns=['sigungu', 'count'])
+    finally:
+        if conn:
+            conn.close() 
+
+# --- 백엔드 함수 3: 플랫폼별 데이터 ---
+@st.cache_data
+def fetch_platform_data(model, start_date, end_date):
+    """플랫폼별 매물 현황 조회 (이 함수는 'platform' 필터를 무시)"""
+    
+    where_clause, params = build_dynamic_query_parts('전체', model, start_date, end_date)
+    sql = f"""
+    SELECT pf.name, COUNT(p.post_id) as count
+    FROM posts AS p
+    JOIN platforms AS pf ON p.platform_id = pf.platform_id
+    JOIN products AS pr ON p.product_id = pr.product_id
+    {where_clause}
+    GROUP BY pf.name ORDER BY count DESC
+    """
+    
+    conn = get_db_connection()
+    if conn is None: return pd.DataFrame(columns=['name', 'count'])
+
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+        return df
+    except Exception as e:
+        st.error(f"플랫폼별 쿼리 오류: {e}")
+        return pd.DataFrame(columns=['name', 'count'])
+    finally:
+        if conn:
+            conn.close() 
+
+# --- 백엔드 함수 4: 가격 변동 추이 ---
+@st.cache_data
+def fetch_price_trend_data(platform, model, start_date, end_date):
+    """일별 평균 가격 변동 추이 조회"""
+    
+    where_clause, params = build_dynamic_query_parts(platform, model, start_date, end_date)
+    
+    sql = f"""
+    SELECT 
+        p.posted_date, 
+        AVG(p.price_krw) as avg_price
+    FROM posts AS p
+    JOIN platforms AS pf ON p.platform_id = pf.platform_id
+    JOIN products AS pr ON p.product_id = pr.product_id
+    {where_clause}
+    GROUP BY p.posted_date
+    ORDER BY p.posted_date ASC
+    """
+    
+    conn = get_db_connection()
+    if conn is None: return pd.DataFrame(columns=['posted_date', 'avg_price'])
+
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+        return df
+    except Exception as e:
+        st.error(f"가격 추이 쿼리 오류: {e}")
+        return pd.DataFrame(columns=['posted_date', 'avg_price'])
+    finally:
+        if conn:
+            conn.close() 
+
+# --- [지도] 지도 위에 원 그리는 함수 ---
+def generate_map_overlay(region_df):
+    """
+    '서울지도보기.jpg'를 불러와서 region_df 데이터 기준으로 '도넛' 원을 그립니다.
+    """
+    try:
+        base_image = Image.open("서울지도보기.jpg").convert("RGBA") 
+        draw = ImageDraw.Draw(base_image)
+    except FileNotFoundError:
+        return None 
+
+    if region_df.empty:
+        return base_image 
+
+    max_count = region_df['count'].max()
+    min_count = region_df['count'].min()
+    
+    for index, row in region_df.iloc[::-1].iterrows():
+        gu_name = row['sigungu']
+        count = row['count']
+        
+        coords = SEOUL_GU_COORDINATES.get(gu_name)
+        if coords: 
+            x, y = coords
+            
+            if max_count == min_count:
+                normalized_count = 1.0
+            else:
+                normalized_count = (count - min_count) / (max_count - min_count)
+            
+            radius = 5 + (normalized_count * 15)
+            alpha = int(100 + (normalized_count * 155))
+            outline_width = int(1 + (normalized_count * 4))
+            outline_color = (255, 87, 51, alpha) 
+            
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=None,
+                outline=outline_color,
+                width=outline_width
+            )
+
+    img_buffer = io.BytesIO()
+    base_image.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
+    
+    return img_buffer
+
+# --- UI (프론트엔드) ---
+st.title('📱 중고 아이폰 시장 분석 대시보드')
+st.caption("플랫폼, 기종, 지역별 데이터를 기반으로 시장 동향을 분석합니다.")
+
+# --- 1. 필터 섹션 ---
+with st.container(border=True):
+    col1, col2, col3, col4 = st.columns([1.3, 1.5, 2, 1.2]) 
+
+    with col1:
+        platform = st.radio(
+            "**플랫폼**",
+            options=['전체', '당근마켓', '중고나라', '번개장터'],
+            index=2, 
+            horizontal=True
+        )
+    
+    with col2:
+        model = st.selectbox(
+            "**아이폰 기종**",
+            options=['iPhone 14', 'iPhone 14 Pro', 'iPhone 15', 'iPhone 15 Pro', 'iPhone 16', 'iPhone 16 Pro'], 
+            index=5 
+        )
+        
+    with col3:
+        date_range = st.date_input(
+            "**기간**",
+            value=(datetime.date(2025, 10, 3), datetime.date(2025, 11, 9)),
+            format="YYYY-MM-DD"
+        )
+    
+    with col4:
+        st.write("") 
+        analysis_button = st.button("🔍 분석 실행", type="primary", use_container_width=True)
+
+st.divider() 
+
+# --- 2. KPI 섹션 ---
+kpi_container = st.container(border=True)
+chart_container = st.container()
+
+# --- 3. 분석 실행 로직 ---
+if analysis_button:
+    # 💡 [중요] CSV 파일을 수정했다면, 캐시를 지워야 합니다.
+    # Streamlit 페이지 우측 상단 메뉴(점 3개) > "Clear cache"를 누르거나, 'C' 키를 누르세요.
+    
+    if len(date_range) == 2:
+        start_date = date_range[0]
+        end_date = date_range[1]
+
+        # 1. 모든 데이터 한 번에 가져오기
+        total_count, avg_price, id_list = fetch_kpi_and_ids(platform, model, start_date, end_date)
+        
+        region_df = fetch_regional_data(platform, model, start_date, end_date, MAP_FILE_PATH) 
+        
+        # 💡 [신규] 매핑 실패 목록(디버그용)을 가져옵니다.
+        unmapped_df = fetch_unmapped_dongs(platform, model, start_date, end_date, MAP_FILE_PATH)
+        
+        platform_df = fetch_platform_data(model, start_date, end_date) 
+        price_trend_df = fetch_price_trend_data(platform, model, start_date, end_date) 
+        
+        map_image = generate_map_overlay(region_df)
+
+        # 2. KPI 카드 업데이트
+        with kpi_container:
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric(label="총 매물 수", value=f"{total_count:,.0f} 건")
+            kpi2.metric(label="평균 가격", value=f"{avg_price:,.0f} 원")
+            
+            with kpi3:
+                st.metric(label="가격 변동 (7일)", value="0.0 %")
+                st.caption("개발 중")
+            
+            most_frequent_region = region_df.iloc[0]['sigungu'] if not region_df.empty else "-"
+            with kpi4:
+                st.metric(label="최다 거래 지역", value=most_frequent_region)
+                if most_frequent_region != "-":
+                    st.caption(f"총 {region_df.iloc[0]['count']}건")
+
+        # 3. 차트 섹션 업데이트 (지도 + 플랫폼 + 가격 추이)
+        with chart_container:
+            chart_col1, chart_col2 = st.columns(2)
+            
+            with chart_col1:
+                st.subheader("📍 지역별 매물 분포 (Top 10)")
+                with st.container(border=True):
+                    if map_image:
+                        st.image(map_image, use_container_width=True)
+                        
+                        if not region_df.empty:
+                            region_df_display = region_df.rename(columns={"sigungu": "구"}) 
+                            st.dataframe(
+                                region_df_display.set_index('구'), 
+                                column_config={"count": "매물 수"},
+                                use_container_width=True
+                            )
+                        
+                        # 💡 [신규] 매핑에 실패한 '동' 목록을 표로 보여줍니다 (디버그용)
+                        if not unmapped_df.empty:
+                            st.divider()
+                            st.subheader("⚠️ 매핑 실패한 '동' 목록 (Debug)")
+                            st.caption("이 목록에 '동'이 보인다면, `dong_gu_map.csv` 파일의 이름과 DB의 이름이 공백 외에 다른 글자(숫자, 특수문자 등)가 다른 것입니다.")
+                            st.dataframe(unmapped_df.set_index("DB에 저장된 '동' 이름"), use_container_width=True)
+
+                    else:
+                        st.error("서울지도보기.jpg 파일을 찾을 수 없습니다.")
+
+            with chart_col2:
+                # --- 플랫폼별 현황 ---
+                st.subheader("📊 플랫폼별 현황")
+                with st.container(border=True): 
+                    if not platform_df.empty:
+                        color_map = {'중고나라': '#77DD77', '번개장터': '#FF6961', '당근마켓': '#FFB347'}
+                        df_colors = platform_df['name'].map(color_map).fillna('#D3D3D3').tolist()
+                        
+                        pull_values = [0] * len(platform_df)
+                        line_widths = [0] * len(platform_df)
+                        line_colors = ['#FFFFFF'] * len(platform_df) 
+                        
+                        if platform != '전체':
+                            try:
+                                platform_names = platform_df['name'].tolist()
+                                if platform in platform_names:
+                                    selected_index = platform_names.index(platform)
+                                    pull_values[selected_index] = 0.1; line_widths[selected_index] = 4; line_colors[selected_index] = '#000000' 
+                            except Exception: pass 
+                        hovertemplate = "<b>%{label}</b><br>매물 수: %{value:,}건<br>비율: %{percent:.1%}<extra></extra>" 
+                        fig = go.Figure(data=[go.Pie(
+                            labels=platform_df['name'], values=platform_df['count'], hovertemplate=hovertemplate,
+                            hole=.4, pull=pull_values, textinfo='label+percent', texttemplate="%{label}<br>%{percent:.1%}", textposition='inside',
+                            marker=dict(colors=df_colors, line=dict(color=line_colors, width=line_widths))
+                        )])
+                        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5),
+                                          annotations=[dict(text='플랫폼', x=0.5, y=0.5, font_size=16, showarrow=False)])
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("해당 조건의 플랫폼 데이터가 없습니다.")
+                
+                # --- 일별 평균 가격 변동 ---
+                st.subheader("📈 일별 평균 가격 변동") 
+                with st.container(border=True):
+                    if not price_trend_df.empty and len(price_trend_df) > 1:
+                        fig_line = go.Figure()
+                        fig_line.add_trace(go.Scatter(
+                            x=price_trend_df['posted_date'], y=price_trend_df['avg_price'],
+                            mode='lines+markers', name='평균 가격',
+                            line=dict(color='#007AFF', width=2), marker=dict(size=6)
+                        ))
+                        fig_line.update_traces(hovertemplate="<b>%{x}</b><br>평균가: %{y:,.0f}원<extra></extra>")
+                        fig_line.update_layout(
+                            yaxis_rangemode='tozero', 
+                            margin=dict(l=0, r=0, t=20, b=0),
+                            height=435, 
+                            xaxis_title=None, yaxis_title=None,
+                            hovermode="x unified"
+                        )
+                        st.plotly_chart(fig_line, use_container_width=True)
+                        
+                    elif not price_trend_df.empty and len(price_trend_df) == 1:
+                        st.info("데이터가 1건만 있어 추이를 그릴 수 없습니다.")
+                    else:
+                        st.info("가격 변동 추이 데이터가 없습니다.")
+
+    else:
+        st.warning("분석 기간을 올바르게 선택해주세요.")
+
+else:
+    # --- 페이지 첫 로드 시 기본 상태 ---
+    with kpi_container:
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric(label="총 매물 수", value="0 건")
+        kpi2.metric(label="평균 가격", value="0 원")
+        with kpi3:
+            st.metric(label="가격 변동 (7일)", value="0.0 %")
+            st.caption("개발 중")
+        with kpi4:
+            st.metric(label="최다 거래 지역", value="-")
+            st.caption("개발 중") 
+            
+    with chart_container:
+        chart_col1, chart_col2 = st.columns(2)
+        
+        with chart_col1:
+            st.subheader("📍 지역별 매물 분포")
+            with st.container(border=True):
+                try:
+                    st.image("서울지도보기.jpg", use_container_width=True)
+                except FileNotFoundError:
+                    st.error("서울지도보기.jpg 파일을 찾을 수 없습니다.")
+
+        with chart_col2:
+            st.subheader("📊 플랫폼별 현황")
+            with st.container(border=True, height=300): 
+                st.info("분석 실행 버튼을 눌러주세요.")
+
+            st.subheader("📈 일별 평균 가격 변동") 
+            with st.container(border=True, height=400):
+                st.info("분석 실행 버튼을 눌러주세요.")
